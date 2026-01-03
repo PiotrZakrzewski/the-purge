@@ -25,23 +25,37 @@ df_clean = (
     )
 )
 
-# 3. Aggregation per Region
-stats = (
+# 3. Create Rich Stats (Pivot Table)
+stats_grouped = (
     df_clean
-    .group_by("Region")
+    .group_by(["Region", "Service"])
     .len()
-    .rename({"len": "Total"})
-    .sort("Total", descending=True)
+    .rename({"len": "Count"})
 )
 
-# 4. Fetch GeoJSON from PDOK (CBS 2024)
+stats_pivot = (
+    stats_grouped
+    .pivot(values="Count", index="Region", on="Service", aggregate_function="sum")
+    .fill_null(0)
+)
+
+for service in ["Ambulance", "Brandweer", "Politie"]:
+    if service not in stats_pivot.columns:
+        stats_pivot = stats_pivot.with_columns(pl.lit(0).alias(service))
+
+stats_pivot = stats_pivot.with_columns(
+    (pl.col("Ambulance") + pl.col("Brandweer") + pl.col("Politie")).alias("Total")
+)
+
+# 4. Fetch GeoJSON from PDOK (EPSG:4326)
 wfs_url = "https://service.pdok.nl/cbs/gebiedsindelingen/2024/wfs/v1_0"
 params = {
     "request": "GetFeature",
     "service": "WFS",
     "version": "2.0.0",
     "typeName": "gebiedsindelingen:veiligheidsregio_gegeneraliseerd",
-    "outputFormat": "application/json"
+    "outputFormat": "application/json",
+    "srsName": "EPSG:4326"
 }
 
 print("Fetching GeoJSON from PDOK...")
@@ -53,8 +67,7 @@ except Exception as e:
     print(f"Error: {e}")
     exit(1)
 
-# 5. Mapping Strategy (P2000 -> GeoJSON statnaam)
-# Based on inspection, statnaam is just the name (e.g. "Groningen", "Haaglanden")
+# 5. Name Normalization
 region_mapping = {
     "amsterdam-amstelland": "Amsterdam-Amstelland",
     "brabant noord": "Brabant-Noord",
@@ -67,6 +80,7 @@ region_mapping = {
     "gelderland-midden": "Gelderland-Midden",
     "gelderland-zuid": "Gelderland-Zuid",
     "noord- en oost gelderland": "Noord- en Oost-Gelderland",
+    "noord- en oost-gelderland": "Noord- en Oost-Gelderland",
     "groningen": "Groningen",
     "haaglanden": "Haaglanden",
     "hollands midden": "Hollands-Midden",
@@ -89,26 +103,33 @@ def get_official_name(p2000_name):
     ln = p2000_name.lower().strip()
     return region_mapping.get(ln, p2000_name)
 
-stats_pd = stats.to_pandas().dropna(subset=['Region'])
-stats_pd['normalized_name'] = stats_pd['Region'].apply(get_official_name)
+stats_rows = stats_pivot.to_dicts()
+data_lookup = {}
+for row in stats_rows:
+    if row["Region"]:
+        norm_name = get_official_name(row["Region"])
+        data_lookup[norm_name] = row
 
-# Debug Mismatches
-geo_names = [f['properties']['statnaam'] for f in geo_data['features']]
-print(f"Sample GeoJSON names: {geo_names[:5]}")
-
-matches = stats_pd[stats_pd['normalized_name'].isin(geo_names)]
-mismatches = stats_pd[~stats_pd['normalized_name'].isin(geo_names)]
-
-print(f"Matches: {len(matches)} / {len(stats_pd)}")
-if not mismatches.empty:
-    print(f"Mismatches: {mismatches['normalized_name'].tolist()}")
+for feature in geo_data['features']:
+    props = feature['properties']
+    region_name = props['statnaam']
+    stats = data_lookup.get(region_name, {"Total": 0, "Ambulance": 0, "Brandweer": 0, "Politie": 0})
+    props['Total Calls'] = stats['Total']
+    props['Ambulance'] = stats['Ambulance']
+    props['Firefighters'] = stats['Brandweer']
+    props['Police'] = stats['Politie']
 
 # 6. Create Map
 m = folium.Map(location=[52.1326, 5.2913], zoom_start=7, tiles="cartodbpositron")
 
-folium.Choropleth(
+# Prepare pandas DF for Choropleth
+stats_pd = stats_pivot.to_pandas()
+stats_pd['normalized_name'] = stats_pd['Region'].apply(get_official_name)
+
+choropleth = folium.Choropleth(
     geo_data=geo_data,
-    data=stats_pd,
+    name="Emergency Calls",
+    data=stats_pd, 
     columns=["normalized_name", "Total"],
     key_on="feature.properties.statnaam",
     fill_color="YlOrRd",
@@ -118,5 +139,16 @@ folium.Choropleth(
     highlight=True
 ).add_to(m)
 
+# Tooltip layer
+folium.GeoJson(
+    geo_data,
+    style_function=lambda x: {'fillColor': 'transparent', 'color': 'transparent', 'weight': 0},
+    tooltip=folium.GeoJsonTooltip(
+        fields=['statnaam', 'Total Calls', 'Ambulance', 'Firefighters', 'Police'],
+        aliases=['Region:', 'Total:', 'Ambulance:', 'Firefighters:', 'Police:'],
+        style=("background-color: white; color: #333333; font-family: arial; font-size: 12px; padding: 10px;")
+    )
+).add_to(m)
+
 m.save("p2000_map.html")
-print("Map saved to p2000_map.html")
+print("Map saved to p2000_map.html with rich tooltips.")
